@@ -1,0 +1,352 @@
+# name: java deployment
+
+# on:
+#   push:
+
+# jobs:
+#   build:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: checkout
+#         uses: actions/checkout@v4
+#       - name: java setup
+#         uses: actions/setup-java@v4
+#         with:
+#           distribution: temurin
+#           java-version: '17'
+#       - name: test and build
+#         run: mvn clean package
+#       - name: upload artifact
+#         uses: actions/upload-artifact@v4
+#         with: 
+#           path: target/*.jar
+#           name: app-jar
+#   deploy:
+#     needs: build
+#     runs-on: ubuntu-latest
+#     steps:
+#       - name: download artifact
+#         uses: actions/download-artifact@v4
+#         with: 
+#           name: app-jar
+#       - name: prepare ssh key
+#         run: |
+#           echo "${{secrets.EC2_SSH_KEY}}" > key.pem
+#           chmod 600 key.pem
+#       - name: scp to send file to ec2
+#         run: |
+#           scp -i key.pem app-jar/*.jar ec2-user@${{ vars.EC2_HOST }}:/opt/myapp/
+#       - name: restart using ssh
+#         run: ssh -i key.pem ec2-user@${{ vars.EC2_HOST }} "systemctl restart myapp"
+#       - name: checking server
+#         run: ssh -i key.pem ec2-user@${{ vars.EC2_HOST }} "systemctl is-active myapp"
+
+
+
+
+deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download JAR artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: artifact
+
+      - name: Verify artifact
+        run: |
+          set -euo pipefail
+
+          JAR_COUNT=$(find artifact -maxdepth 1 -type f -name "*.jar" | wc -l)
+
+          if [ "$JAR_COUNT" -ne 1 ]; then
+            echo "ERROR: Expected exactly one JAR, found $JAR_COUNT"
+            find artifact -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+          JAR=$(find artifact -maxdepth 1 -type f -name "*.jar" -print -quit)
+
+          echo "JAR_PATH=$JAR" >> "$GITHUB_ENV"
+          echo "Using JAR: $JAR"
+
+      - name: Validate configuration
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$EC2_HOST" ]; then
+            echo "ERROR: EC2_HOST is not configured."
+            exit 1
+          fi
+
+          if [ -z "$EC2_SSH_KEY" ]; then
+            echo "ERROR: EC2_SSH_KEY is not configured."
+            exit 1
+          fi
+
+      - name: Prepare SSH
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ vars.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
+          umask 077
+          printf '%s\n' "$EC2_SSH_KEY" > key.pem
+          chmod 600 key.pem
+
+          ssh-keygen -y -f key.pem > /dev/null
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Check SSH connection
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i key.pem \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            ec2-user@"$EC2_HOST" \
+            "echo 'Connected to EC2 successfully'"
+
+      - name: Check and install Java 17
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i key.pem \
+            -o BatchMode=yes \
+            ec2-user@"$EC2_HOST" \
+            'bash -s' <<'REMOTE_SCRIPT'
+
+          set -euo pipefail
+
+          echo "======================================"
+          echo "Checking Java"
+          echo "======================================"
+
+          JAVA_OK=false
+
+          # Check whether Java exists and is Java 17.
+          if command -v java >/dev/null 2>&1; then
+              JAVA_VERSION=$(java -version 2>&1 | head -n 1 || true)
+
+              echo "Java found:"
+              echo "$JAVA_VERSION"
+
+              if java -version 2>&1 | grep -q '"17\.'; then
+                  JAVA_OK=true
+                  echo "Java 17 is already installed."
+              else
+                  echo "Java exists, but it is not Java 17."
+              fi
+          else
+              echo "Java is not installed."
+          fi
+
+          # --------------------------------------------------
+          # Install Java 17 if necessary
+          # --------------------------------------------------
+
+          if [ "$JAVA_OK" = false ]; then
+
+              echo
+              echo "Installing Java 17..."
+
+              # Amazon Linux 2023
+              if [ -f /etc/os-release ] && grep -qi "Amazon Linux" /etc/os-release; then
+
+                  if command -v dnf >/dev/null 2>&1; then
+                      sudo dnf install -y java-17-amazon-corretto
+
+                  elif command -v yum >/dev/null 2>&1; then
+                      sudo yum install -y java-17-amazon-corretto
+
+                  else
+                      echo "ERROR: Could not find dnf or yum."
+                      exit 1
+                  fi
+
+              # Ubuntu / Debian
+              elif command -v apt-get >/dev/null 2>&1; then
+
+                  sudo apt-get update
+                  sudo apt-get install -y openjdk-17-jdk
+
+              else
+                  echo "ERROR: Unsupported Linux distribution."
+                  echo "Please install Java 17 manually."
+                  exit 1
+              fi
+          fi
+
+          # --------------------------------------------------
+          # Verify Java after installation
+          # --------------------------------------------------
+
+          echo
+          echo "======================================"
+          echo "Verifying Java 17"
+          echo "======================================"
+
+          if ! command -v java >/dev/null 2>&1; then
+              echo "ERROR: Java installation failed."
+              exit 1
+          fi
+
+          java -version
+
+          if ! java -version 2>&1 | grep -q '"17\.'; then
+              echo "ERROR: Java 17 is not active."
+              exit 1
+          fi
+
+          echo "Java 17 is ready."
+
+          REMOTE_SCRIPT
+
+      - name: Create application directory
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i key.pem \
+            -o BatchMode=yes \
+            ec2-user@"$EC2_HOST" \
+            "sudo mkdir -p /opt/myapp && sudo chown ec2-user:ec2-user /opt/myapp"
+
+      - name: Upload application JAR
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
+          scp \
+            -i key.pem \
+            -o BatchMode=yes \
+            "$JAR_PATH" \
+            ec2-user@"$EC2_HOST":/opt/myapp/app.jar
+
+      - name: Start or restart application
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i key.pem \
+            -o BatchMode=yes \
+            ec2-user@"$EC2_HOST" \
+            'bash -s' <<'REMOTE_SCRIPT'
+
+          set -euo pipefail
+
+          APP_DIR="/opt/myapp"
+          APP_JAR="$APP_DIR/app.jar"
+          SERVICE="myapp"
+
+          echo "======================================"
+          echo "Checking application"
+          echo "======================================"
+
+          # Make sure the JAR exists.
+          if [ ! -s "$APP_JAR" ]; then
+              echo "ERROR: $APP_JAR does not exist or is empty."
+              exit 1
+          fi
+
+          sudo chmod 644 "$APP_JAR"
+
+          # Make sure systemd knows about the service.
+          if ! systemctl list-unit-files | grep -q "^${SERVICE}.service"; then
+              echo "ERROR: ${SERVICE}.service does not exist."
+              echo
+              echo "Expected service file:"
+              echo "/etc/systemd/system/myapp.service"
+              exit 1
+          fi
+
+          sudo systemctl daemon-reload
+
+          echo
+          echo "======================================"
+          echo "Starting/restarting application"
+          echo "======================================"
+
+          # If service is already running, restart it.
+          if sudo systemctl is-active --quiet "$SERVICE"; then
+              echo "Application is already running."
+              echo "Restarting application..."
+
+              sudo systemctl restart "$SERVICE"
+
+          else
+              echo "Application is not running."
+              echo "Starting application..."
+
+              sudo systemctl start "$SERVICE"
+          fi
+
+          # Enable application to start automatically after EC2 reboot.
+          sudo systemctl enable "$SERVICE"
+
+          echo
+          echo "Waiting for application..."
+
+          for i in {1..15}; do
+              if sudo systemctl is-active --quiet "$SERVICE"; then
+                  echo
+                  echo "======================================"
+                  echo "Application is running successfully."
+                  echo "======================================"
+
+                  sudo systemctl --no-pager status "$SERVICE"
+                  exit 0
+              fi
+
+              echo "Waiting... attempt $i/15"
+              sleep 2
+          done
+
+          # --------------------------------------------------
+          # Application failed to start
+          # --------------------------------------------------
+
+          echo
+          echo "======================================"
+          echo "APPLICATION FAILED TO START"
+          echo "======================================"
+
+          echo
+          echo "Systemd status:"
+          sudo systemctl --no-pager status "$SERVICE" || true
+
+          echo
+          echo "Application logs:"
+          sudo journalctl -u "$SERVICE" -n 100 --no-pager || true
+
+          exit 1
+
+          REMOTE_SCRIPT
+
+      - name: Cleanup SSH key
+        if: always()
+        run: |
+          rm -f key.pem
