@@ -48,8 +48,6 @@ name: Java Deployment
 
 on:
   push:
-    branches:
-      - main
 
 permissions:
   contents: read
