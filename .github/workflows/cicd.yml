@@ -41,6 +41,7 @@
 #       - name: checking server
 #         run: ssh -i key.pem ec2-user@${{ vars.EC2_HOST }} "systemctl is-active myapp"
 
+
 name: Java Deployment
 
 on:
@@ -52,54 +53,32 @@ permissions:
 
 jobs:
 
-  # ============================================================
+  # ==========================================================
   # BUILD
-  # ============================================================
+  # ==========================================================
   build:
     name: Build and Test
     runs-on: ubuntu-latest
 
     steps:
 
-      # ----------------------------------------------------------
-      # Checkout
-      # ----------------------------------------------------------
-      - name: Checkout source code
+      - name: Checkout
         uses: actions/checkout@v5
 
-
-      # ----------------------------------------------------------
-      # Java 17
-      # ----------------------------------------------------------
-      - name: Set up Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: maven
 
-
-      # ----------------------------------------------------------
-      # Check Java and Maven
-      # ----------------------------------------------------------
-      - name: Check Java and Maven
+      - name: Check Java
         run: |
-          set -euo pipefail
-
-          echo "Java:"
           java -version
-
-          echo
-          echo "Maven:"
           mvn -version
 
-
-      # ----------------------------------------------------------
-      # Build Maven project
-      #
       # pom.xml is inside hello-world/
-      # ----------------------------------------------------------
-      - name: Build and test
+      - name: Build and Test
         working-directory: ./hello-world
         run: |
           set -euo pipefail
@@ -110,53 +89,19 @@ jobs:
             --fail-at-end \
             clean package
 
-
-      # ----------------------------------------------------------
-      # Find JAR
-      # ----------------------------------------------------------
-      - name: Verify generated JAR
+      - name: Find JAR
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Generated JAR files:"
+          echo "JAR files:"
           find hello-world/target \
             -maxdepth 1 \
             -type f \
             -name "*.jar" \
             -print
 
-
-          JAR_COUNT=$(find hello-world/target \
-            -maxdepth 1 \
-            -type f \
-            -name "*.jar" \
-            -not -name "*-sources.jar" \
-            -not -name "*-javadoc.jar" \
-            | wc -l)
-
-
-          if [ "$JAR_COUNT" -eq 0 ]; then
-            echo "ERROR: No deployable JAR was generated."
-            exit 1
-          fi
-
-
-          if [ "$JAR_COUNT" -gt 1 ]; then
-            echo "ERROR: Multiple deployable JARs were generated."
-
-            find hello-world/target \
-              -maxdepth 1 \
-              -type f \
-              -name "*.jar" \
-              -not -name "*-sources.jar" \
-              -not -name "*-javadoc.jar"
-
-            exit 1
-          fi
-
-
-          JAR_PATH=$(find hello-world/target \
+          JAR=$(find hello-world/target \
             -maxdepth 1 \
             -type f \
             -name "*.jar" \
@@ -164,26 +109,25 @@ jobs:
             -not -name "*-javadoc.jar" \
             -print -quit)
 
+          if [ -z "$JAR" ]; then
+            echo "ERROR: No JAR found."
+            exit 1
+          fi
 
-          echo "JAR found:"
-          echo "$JAR_PATH"
+          echo "Found JAR:"
+          echo "$JAR"
 
-
-      # ----------------------------------------------------------
-      # Upload artifact
-      # ----------------------------------------------------------
-      - name: Upload JAR artifact
+      - name: Upload JAR
         uses: actions/upload-artifact@v4
         with:
           name: app-jar
           path: hello-world/target/*.jar
           if-no-files-found: error
-          retention-days: 7
 
 
-  # ============================================================
+  # ==========================================================
   # DEPLOY
-  # ============================================================
+  # ==========================================================
   deploy:
     name: Deploy to EC2
     needs: build
@@ -191,104 +135,49 @@ jobs:
 
     steps:
 
-      # ----------------------------------------------------------
-      # Download artifact
-      # ----------------------------------------------------------
-      - name: Download JAR artifact
+      # --------------------------------------------------------
+      # Download JAR
+      # --------------------------------------------------------
+      - name: Download JAR
         uses: actions/download-artifact@v4
         with:
           name: app-jar
           path: artifact
 
-
-      # ----------------------------------------------------------
-      # Find downloaded JAR
-      # ----------------------------------------------------------
-      - name: Verify downloaded JAR
-        shell: bash
+      - name: Check downloaded JAR
         run: |
           set -euo pipefail
 
-          echo "Downloaded files:"
+          echo "Downloaded artifact:"
           ls -lah artifact/
 
-
-          JAR_COUNT=$(find artifact \
-            -maxdepth 1 \
-            -type f \
-            -name "*.jar" \
-            | wc -l)
-
-
-          if [ "$JAR_COUNT" -ne 1 ]; then
-            echo "ERROR: Expected exactly one JAR."
-            echo "Found: $JAR_COUNT"
-            exit 1
-          fi
-
-
-          JAR_PATH=$(find artifact \
+          JAR=$(find artifact \
             -maxdepth 1 \
             -type f \
             -name "*.jar" \
             -print -quit)
 
-
-          echo "JAR_PATH=$JAR_PATH" >> "$GITHUB_ENV"
-
-          echo "Using JAR:"
-          echo "$JAR_PATH"
-
-
-      # ========================================================
-      # VALIDATE CONFIGURATION
-      # ========================================================
-      - name: Validate deployment configuration
-        shell: bash
-        env:
-          EC2_HOST: ${{ vars.EC2_HOST }}
-          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-        run: |
-          set -euo pipefail
-
-          echo "Checking deployment configuration..."
-
-
-          if [ -z "$EC2_HOST" ]; then
-            echo "ERROR: EC2_HOST is empty."
+          if [ -z "$JAR" ]; then
+            echo "ERROR: JAR not found."
             exit 1
           fi
 
+          echo "JAR_PATH=$JAR" >> "$GITHUB_ENV"
+
+
+      # --------------------------------------------------------
+      # SSH KEY
+      # --------------------------------------------------------
+      - name: Prepare SSH key
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          set -euo pipefail
 
           if [ -z "$EC2_SSH_KEY" ]; then
             echo "ERROR: EC2_SSH_KEY is empty."
             exit 1
           fi
-
-
-          # Host must be only an IP/hostname.
-          if [[ "$EC2_HOST" =~ [^a-zA-Z0-9.-] ]]; then
-            echo "ERROR: EC2_HOST contains invalid characters."
-            echo "Current value: [$EC2_HOST]"
-            exit 1
-          fi
-
-
-          echo "EC2_HOST: [$EC2_HOST]"
-          echo "EC2_USER: [ec2-user]"
-
-          echo "Configuration is valid."
-
-
-      # ========================================================
-      # PREPARE SSH KEY
-      # ========================================================
-      - name: Prepare SSH key
-        shell: bash
-        env:
-          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-        run: |
-          set -euo pipefail
 
           umask 077
 
@@ -296,64 +185,55 @@ jobs:
 
           chmod 600 key.pem
 
+          echo "Validating SSH key..."
 
-          echo "Validating private key..."
+          ssh-keygen -y -f key.pem > /tmp/public-key
 
-          ssh-keygen -y -f key.pem > /tmp/github-public-key.pub
+          echo "SSH key is valid."
 
-
-          echo "SSH private key is valid."
-
-          echo "GitHub SSH key fingerprint:"
-          ssh-keygen -lf /tmp/github-public-key.pub
+          echo "Key fingerprint:"
+          ssh-keygen -lf /tmp/public-key
 
 
-      # ========================================================
-      # KNOWN HOSTS
-      # ========================================================
-      - name: Configure SSH known hosts
-        shell: bash
+      # --------------------------------------------------------
+      # SSH HOST
+      # --------------------------------------------------------
+      - name: Configure known hosts
         env:
           EC2_HOST: ${{ vars.EC2_HOST }}
         run: |
           set -euo pipefail
 
+          if [ -z "$EC2_HOST" ]; then
+            echo "ERROR: EC2_HOST is empty."
+            exit 1
+          fi
+
           mkdir -p ~/.ssh
+
           chmod 700 ~/.ssh
-
-
-          echo "Getting EC2 host key..."
 
           ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
 
-
           chmod 600 ~/.ssh/known_hosts
 
-          echo "Known host configured."
 
-
-      # ========================================================
+      # --------------------------------------------------------
       # TEST SSH
-      # ========================================================
-      - name: Test EC2 SSH connection
-        shell: bash
+      # --------------------------------------------------------
+      - name: Test SSH
         env:
           EC2_HOST: ${{ vars.EC2_HOST }}
         run: |
           set -euo pipefail
 
-          echo "======================================"
-          echo "Testing EC2 SSH connection"
-          echo "======================================"
-
-
           SSH_TARGET="ec2-user@${EC2_HOST}"
 
+          echo "======================================"
+          echo "Testing SSH"
+          echo "======================================"
 
-          echo "Host: [$EC2_HOST]"
-          echo "User: [ec2-user]"
-          echo "SSH target: [$SSH_TARGET]"
-
+          echo "Target: $SSH_TARGET"
 
           ssh \
             -i key.pem \
@@ -361,14 +241,13 @@ jobs:
             -o ConnectTimeout=15 \
             -o StrictHostKeyChecking=yes \
             "$SSH_TARGET" \
-            "echo 'EC2 SSH connection successful'; echo 'Remote user:'; whoami; echo 'Hostname:'; hostname"
+            "echo SSH SUCCESS; whoami; hostname"
 
 
       # ========================================================
-      # CHECK / INSTALL JAVA
+      # UPLOAD JAR
       # ========================================================
-      - name: Check and install Java 17
-        shell: bash
+      - name: Upload application
         env:
           EC2_HOST: ${{ vars.EC2_HOST }}
         run: |
@@ -376,31 +255,124 @@ jobs:
 
           SSH_TARGET="ec2-user@${EC2_HOST}"
 
+          echo "======================================"
+          echo "Preparing /opt/myapp"
+          echo "======================================"
 
           ssh \
             -i key.pem \
             -o BatchMode=yes \
-            -o ConnectTimeout=15 \
+            "$SSH_TARGET" \
+            'bash -s' <<'REMOTE'
+
+          set -euo pipefail
+
+          sudo mkdir -p /opt/myapp
+
+          sudo chown ec2-user:ec2-user /opt/myapp
+
+          sudo chmod 755 /opt/myapp
+
+          echo "Application directory ready."
+
+          REMOTE
+
+
+          echo "======================================"
+          echo "Uploading JAR"
+          echo "======================================"
+
+          scp \
+            -i key.pem \
+            -o BatchMode=yes \
+            "$JAR_PATH" \
+            "$SSH_TARGET:/opt/myapp/app.jar"
+
+          echo "JAR uploaded."
+
+
+      # ========================================================
+      # VERIFY JAR
+      # ========================================================
+      - name: Verify application
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
+          SSH_TARGET="ec2-user@${EC2_HOST}"
+
+          ssh \
+            -i key.pem \
+            -o BatchMode=yes \
+            "$SSH_TARGET" \
+            'bash -s' <<'REMOTE'
+
+          set -euo pipefail
+
+          if [ ! -f /opt/myapp/app.jar ]; then
+            echo "ERROR: JAR does not exist."
+            exit 1
+          fi
+
+          if [ ! -s /opt/myapp/app.jar ]; then
+            echo "ERROR: JAR is empty."
+            exit 1
+          fi
+
+          echo "Application JAR:"
+          ls -lh /opt/myapp/app.jar
+
+          REMOTE
+
+
+      # ========================================================
+      # INSTALL JAVA + CREATE SYSTEMD + START APPLICATION
+      # ========================================================
+      - name: Install Java and start application
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
+          SSH_TARGET="ec2-user@${EC2_HOST}"
+
+          echo "======================================"
+          echo "Connecting to EC2"
+          echo "======================================"
+
+          ssh \
+            -i key.pem \
+            -o BatchMode=yes \
             "$SSH_TARGET" \
             'bash -s' <<'REMOTE_SCRIPT'
 
           set -euo pipefail
 
 
+          APP_DIR="/opt/myapp"
+          APP_JAR="$APP_DIR/app.jar"
+          SERVICE_NAME="myapp"
+          SERVICE_FILE="/etc/systemd/system/myapp.service"
+
+
+          echo
           echo "======================================"
-          echo "Checking Java"
+          echo "1. CHECKING JAVA"
           echo "======================================"
 
+
+          # ====================================================
+          # JAVA CHECK
+          # ====================================================
 
           JAVA_OK=false
 
 
-          # ----------------------------------------------------
-          # Check Java
-          # ----------------------------------------------------
           if command -v java >/dev/null 2>&1; then
 
-            echo "Java is installed:"
+            echo "Java is already installed."
+
             java -version
 
 
@@ -408,11 +380,11 @@ jobs:
 
               JAVA_OK=true
 
-              echo "Java 17 is already installed."
+              echo "Java 17 detected."
 
             else
 
-              echo "Java exists, but it is not Java 17."
+              echo "Java is not Java 17."
 
             fi
 
@@ -423,15 +395,14 @@ jobs:
           fi
 
 
-          # ----------------------------------------------------
-          # Install Java if required
-          # ----------------------------------------------------
+          # ====================================================
+          # INSTALL JAVA
+          # ====================================================
+
           if [ "$JAVA_OK" = false ]; then
 
             echo
-            echo "======================================"
-            echo "Installing Java 17"
-            echo "======================================"
+            echo "Installing Java 17..."
 
 
             if [ -f /etc/os-release ] && \
@@ -450,7 +421,7 @@ jobs:
 
               else
 
-                echo "ERROR: dnf/yum not available."
+                echo "ERROR: yum/dnf not found."
                 exit 1
 
               fi
@@ -458,8 +429,7 @@ jobs:
 
             elif command -v apt-get >/dev/null 2>&1; then
 
-              echo "Ubuntu/Debian detected."
-
+              echo "Debian/Ubuntu detected."
 
               sudo apt-get update
 
@@ -469,6 +439,9 @@ jobs:
             else
 
               echo "ERROR: Unsupported Linux distribution."
+
+              cat /etc/os-release || true
+
               exit 1
 
             fi
@@ -476,205 +449,59 @@ jobs:
           fi
 
 
-          # ----------------------------------------------------
-          # Verify Java
-          # ----------------------------------------------------
+          # ====================================================
+          # VERIFY JAVA
+          # ====================================================
+
           echo
           echo "======================================"
-          echo "Verifying Java 17"
+          echo "2. VERIFYING JAVA"
           echo "======================================"
 
 
           if ! command -v java >/dev/null 2>&1; then
 
-            echo "ERROR: Java command not found after installation."
+            echo "ERROR: Java command not found."
+
             exit 1
 
           fi
+
+
+          JAVA_BIN="$(command -v java)"
+
+          JAVA_BIN="$(readlink -f "$JAVA_BIN")"
+
+
+          echo "Java executable:"
+          echo "$JAVA_BIN"
 
 
           java -version
 
 
-          JAVA_VERSION=$(java -version 2>&1 | head -n 1)
-
-          echo "Java version: $JAVA_VERSION"
-
-
           if ! java -version 2>&1 | grep -q '"17\.'; then
 
             echo "ERROR: Java 17 is not active."
+
             exit 1
 
           fi
 
 
-          echo "Java 17 is ready."
-
+          # ====================================================
+          # VERIFY JAR
+          # ====================================================
 
           echo
-          echo "Java executable:"
-          readlink -f "$(command -v java)" || true
-
-
-          REMOTE_SCRIPT
-
-
-      # ========================================================
-      # PREPARE APPLICATION DIRECTORY
-      # ========================================================
-      - name: Prepare application directory
-        shell: bash
-        env:
-          EC2_HOST: ${{ vars.EC2_HOST }}
-        run: |
-          set -euo pipefail
-
-          SSH_TARGET="ec2-user@${EC2_HOST}"
-
-
-          ssh \
-            -i key.pem \
-            -o BatchMode=yes \
-            -o ConnectTimeout=15 \
-            "$SSH_TARGET" \
-            'bash -s' <<'REMOTE_SCRIPT'
-
-          set -euo pipefail
-
-
-          APP_DIR="/opt/myapp"
-
-
           echo "======================================"
-          echo "Preparing application directory"
+          echo "3. VERIFYING APPLICATION"
           echo "======================================"
-
-
-          sudo mkdir -p "$APP_DIR"
-
-
-          sudo chown ec2-user:ec2-user "$APP_DIR"
-
-
-          sudo chmod 755 "$APP_DIR"
-
-
-          echo "Application directory:"
-          ls -ld "$APP_DIR"
-
-
-          REMOTE_SCRIPT
-
-
-      # ========================================================
-      # BACKUP CURRENT JAR
-      # ========================================================
-      - name: Backup current application
-        shell: bash
-        env:
-          EC2_HOST: ${{ vars.EC2_HOST }}
-        run: |
-          set -euo pipefail
-
-          SSH_TARGET="ec2-user@${EC2_HOST}"
-
-
-          ssh \
-            -i key.pem \
-            -o BatchMode=yes \
-            "$SSH_TARGET" \
-            'bash -s' <<'REMOTE_SCRIPT'
-
-          set -euo pipefail
-
-
-          APP_JAR="/opt/myapp/app.jar"
-          BACKUP_JAR="/opt/myapp/app.jar.backup"
-
-
-          if [ -f "$APP_JAR" ]; then
-
-            echo "Backing up current application..."
-
-            sudo cp "$APP_JAR" "$BACKUP_JAR"
-
-            sudo chmod 644 "$BACKUP_JAR"
-
-            echo "Backup created."
-
-          else
-
-            echo "No previous application found."
-            echo "This appears to be the first deployment."
-
-          fi
-
-
-          REMOTE_SCRIPT
-
-
-      # ========================================================
-      # UPLOAD JAR
-      # ========================================================
-      - name: Upload JAR to EC2
-        shell: bash
-        env:
-          EC2_HOST: ${{ vars.EC2_HOST }}
-        run: |
-          set -euo pipefail
-
-          SSH_TARGET="ec2-user@${EC2_HOST}"
-
-
-          echo "======================================"
-          echo "Uploading JAR"
-          echo "======================================"
-
-
-          echo "Local JAR:"
-          echo "$JAR_PATH"
-
-
-          scp \
-            -i key.pem \
-            -o BatchMode=yes \
-            -o ConnectTimeout=15 \
-            "$JAR_PATH" \
-            "$SSH_TARGET:/opt/myapp/app.jar"
-
-
-          echo "JAR uploaded successfully."
-
-
-      # ========================================================
-      # VERIFY JAR
-      # ========================================================
-      - name: Verify JAR on EC2
-        shell: bash
-        env:
-          EC2_HOST: ${{ vars.EC2_HOST }}
-        run: |
-          set -euo pipefail
-
-          SSH_TARGET="ec2-user@${EC2_HOST}"
-
-
-          ssh \
-            -i key.pem \
-            -o BatchMode=yes \
-            "$SSH_TARGET" \
-            'bash -s' <<'REMOTE_SCRIPT'
-
-          set -euo pipefail
-
-
-          APP_JAR="/opt/myapp/app.jar"
 
 
           if [ ! -f "$APP_JAR" ]; then
 
-            echo "ERROR: JAR does not exist:"
+            echo "ERROR: Application JAR missing:"
             echo "$APP_JAR"
 
             exit 1
@@ -682,80 +509,34 @@ jobs:
           fi
 
 
-          if [ ! -s "$APP_JAR" ]; then
-
-            echo "ERROR: JAR is empty."
-
-            exit 1
-
-          fi
-
-
-          chmod 644 "$APP_JAR"
-
-
-          echo "JAR uploaded:"
           ls -lh "$APP_JAR"
 
 
-          REMOTE_SCRIPT
+          # ====================================================
+          # BACKUP PREVIOUS JAR
+          # ====================================================
 
+          if [ -f "$APP_DIR/app.jar" ]; then
 
-      # ========================================================
-      # CREATE / UPDATE SYSTEMD SERVICE
-      # ========================================================
-      - name: Configure systemd service
-        shell: bash
-        env:
-          EC2_HOST: ${{ vars.EC2_HOST }}
-        run: |
-          set -euo pipefail
-
-          SSH_TARGET="ec2-user@${EC2_HOST}"
-
-
-          ssh \
-            -i key.pem \
-            -o BatchMode=yes \
-            "$SSH_TARGET" \
-            'bash -s' <<'REMOTE_SCRIPT'
-
-          set -euo pipefail
-
-
-          SERVICE_NAME="myapp"
-          SERVICE_FILE="/etc/systemd/system/myapp.service"
-
-
-          echo "======================================"
-          echo "Configuring systemd"
-          echo "======================================"
-
-
-          # ----------------------------------------------------
-          # Find Java
-          # ----------------------------------------------------
-          JAVA_BIN=$(command -v java || true)
-
-
-          if [ -z "$JAVA_BIN" ]; then
-
-            echo "ERROR: Java is not installed."
-            exit 1
+            echo "Application JAR exists."
 
           fi
 
 
-          JAVA_BIN=$(readlink -f "$JAVA_BIN")
+          # ====================================================
+          # CREATE SYSTEMD SERVICE
+          # ====================================================
+
+          echo
+          echo "======================================"
+          echo "4. CREATING SYSTEMD SERVICE"
+          echo "======================================"
 
 
-          echo "Java executable:"
-          echo "$JAVA_BIN"
+          echo "Service file:"
+          echo "$SERVICE_FILE"
 
 
-          # ----------------------------------------------------
-          # Create service
-          # ----------------------------------------------------
           sudo tee "$SERVICE_FILE" > /dev/null <<EOF
           [Unit]
           Description=Hello World Java Application
@@ -763,17 +544,12 @@ jobs:
 
           [Service]
           Type=simple
-
           User=ec2-user
           Group=ec2-user
-
           WorkingDirectory=/opt/myapp
-
           ExecStart=$JAVA_BIN -jar /opt/myapp/app.jar
-
           Restart=always
           RestartSec=5
-
           SuccessExitStatus=143
 
           [Install]
@@ -781,122 +557,124 @@ jobs:
           EOF
 
 
-          echo "Service file created:"
-
+          echo
+          echo "Service file contents:"
+          echo "--------------------------------------"
 
           sudo cat "$SERVICE_FILE"
 
-
-          # ----------------------------------------------------
-          # Reload systemd
-          # ----------------------------------------------------
-          sudo systemctl daemon-reload
+          echo "--------------------------------------"
 
 
-          # ----------------------------------------------------
-          # Enable service
-          # ----------------------------------------------------
-          sudo systemctl enable "$SERVICE_NAME"
+          # ====================================================
+          # VERIFY FILE
+          # ====================================================
 
+          if [ ! -f "$SERVICE_FILE" ]; then
 
-          echo "systemd service configured."
-
-
-          REMOTE_SCRIPT
-
-
-      # ========================================================
-      # START / RESTART APPLICATION
-      # ========================================================
-      - name: Start or restart application
-        shell: bash
-        env:
-          EC2_HOST: ${{ vars.EC2_HOST }}
-        run: |
-          set -euo pipefail
-
-          SSH_TARGET="ec2-user@${EC2_HOST}"
-
-
-          ssh \
-            -i key.pem \
-            -o BatchMode=yes \
-            "$SSH_TARGET" \
-            'bash -s' <<'REMOTE_SCRIPT'
-
-          set -euo pipefail
-
-
-          SERVICE="myapp"
-
-
-          echo "======================================"
-          echo "Starting application"
-          echo "======================================"
-
-
-          # ----------------------------------------------------
-          # Verify service exists
-          # ----------------------------------------------------
-          if ! systemctl list-unit-files \
-              --type=service \
-              | grep -q "^${SERVICE}.service"; then
-
-            echo "ERROR: systemd service was not created."
+            echo "ERROR: systemd service file was NOT created."
 
             exit 1
 
           fi
 
 
-          # ----------------------------------------------------
-          # Restart/start service
-          # ----------------------------------------------------
-          if sudo systemctl is-active --quiet "$SERVICE"; then
+          echo "Systemd service file exists."
 
-            echo "Application is already running."
-            echo "Restarting application..."
 
-            sudo systemctl restart "$SERVICE"
+          # ====================================================
+          # SYSTEMD RELOAD
+          # ====================================================
+
+          echo
+          echo "======================================"
+          echo "5. RELOADING SYSTEMD"
+          echo "======================================"
+
+
+          sudo systemctl daemon-reload
+
+
+          # ====================================================
+          # VERIFY SYSTEMD
+          # ====================================================
+
+          echo
+          echo "Checking systemd configuration..."
+
+
+          sudo systemctl cat "$SERVICE_NAME"
+
+
+          # ====================================================
+          # ENABLE SERVICE
+          # ====================================================
+
+          echo
+          echo "======================================"
+          echo "6. ENABLING SERVICE"
+          echo "======================================"
+
+
+          sudo systemctl enable "$SERVICE_NAME"
+
+
+          # ====================================================
+          # STOP OLD SERVICE IF RUNNING
+          # ====================================================
+
+          echo
+          echo "======================================"
+          echo "7. STARTING APPLICATION"
+          echo "======================================"
+
+
+          if sudo systemctl is-active --quiet "$SERVICE_NAME"; then
+
+            echo "Application is currently running."
+
+            echo "Restarting..."
+
+            sudo systemctl restart "$SERVICE_NAME"
 
           else
 
             echo "Application is not running."
-            echo "Starting application..."
 
-            sudo systemctl start "$SERVICE"
+            echo "Starting..."
+
+            sudo systemctl start "$SERVICE_NAME"
 
           fi
 
 
-          # ----------------------------------------------------
-          # Wait for application
-          # ----------------------------------------------------
+          # ====================================================
+          # WAIT FOR APPLICATION
+          # ====================================================
+
           echo
-          echo "Waiting for application to start..."
+          echo "Waiting for application..."
 
 
           for i in {1..20}; do
 
-            if sudo systemctl is-active --quiet "$SERVICE"; then
+            if sudo systemctl is-active --quiet "$SERVICE_NAME"; then
 
               echo
               echo "======================================"
-              echo "APPLICATION IS RUNNING"
+              echo "APPLICATION STARTED SUCCESSFULLY"
               echo "======================================"
-
 
               sudo systemctl \
                 --no-pager \
-                status "$SERVICE"
-
+                status "$SERVICE_NAME"
 
               exit 0
 
             fi
 
 
-            echo "Attempt $i/20..."
+            echo "Attempt $i/20"
 
             sleep 2
 
@@ -904,29 +682,28 @@ jobs:
 
 
           # ====================================================
-          # APPLICATION FAILED
+          # FAILURE
           # ====================================================
+
           echo
           echo "======================================"
-          echo "APPLICATION FAILED TO START"
+          echo "APPLICATION FAILED"
           echo "======================================"
 
 
           echo
           echo "Systemd status:"
 
-
           sudo systemctl \
             --no-pager \
-            status "$SERVICE" || true
+            status "$SERVICE_NAME" || true
 
 
           echo
-          echo "Application logs:"
-
+          echo "Systemd logs:"
 
           sudo journalctl \
-            -u "$SERVICE" \
+            -u "$SERVICE_NAME" \
             -n 100 \
             --no-pager || true
 
@@ -938,10 +715,9 @@ jobs:
 
 
       # ========================================================
-      # HEALTH CHECK
+      # FINAL HEALTH CHECK
       # ========================================================
-      - name: Check application service
-        shell: bash
+      - name: Final health check
         env:
           EC2_HOST: ${{ vars.EC2_HOST }}
         run: |
@@ -949,41 +725,35 @@ jobs:
 
           SSH_TARGET="ec2-user@${EC2_HOST}"
 
-
           ssh \
             -i key.pem \
             -o BatchMode=yes \
             "$SSH_TARGET" \
-            'bash -s' <<'REMOTE_SCRIPT'
+            'bash -s' <<'REMOTE'
 
           set -euo pipefail
 
 
-          SERVICE="myapp"
-
-
           echo "======================================"
-          echo "Final health check"
+          echo "FINAL HEALTH CHECK"
           echo "======================================"
 
 
-          if sudo systemctl is-active --quiet "$SERVICE"; then
+          if sudo systemctl is-active --quiet myapp; then
 
-            echo "Service status: ACTIVE"
+            echo "myapp is ACTIVE."
 
           else
 
-            echo "Service status: NOT ACTIVE"
+            echo "ERROR: myapp is NOT ACTIVE."
 
-            sudo systemctl \
-              --no-pager \
-              status "$SERVICE" || true
+            sudo systemctl status myapp --no-pager || true
 
             echo
             echo "Recent logs:"
 
             sudo journalctl \
-              -u "$SERVICE" \
+              -u myapp \
               -n 100 \
               --no-pager || true
 
@@ -995,15 +765,13 @@ jobs:
           echo
           echo "Service enabled status:"
 
-          sudo systemctl is-enabled "$SERVICE"
+          sudo systemctl is-enabled myapp
 
 
           echo
           echo "Application status:"
 
-          sudo systemctl \
-            --no-pager \
-            status "$SERVICE"
+          sudo systemctl status myapp --no-pager
 
 
           echo
@@ -1012,14 +780,13 @@ jobs:
           echo "======================================"
 
 
-          REMOTE_SCRIPT
+          REMOTE
 
 
       # ========================================================
       # CLEANUP
       # ========================================================
-      - name: Cleanup SSH private key
+      - name: Cleanup
         if: always()
-        shell: bash
         run: |
           rm -f key.pem
