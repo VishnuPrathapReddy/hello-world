@@ -48,42 +48,53 @@ name: Java Deployment
 
 on:
   push:
+    branches:
+      - main
 
 permissions:
   contents: read
 
 jobs:
 
-  # ============================================================
-  # BUILD
-  # ============================================================
   build:
     name: Build and Test
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout source code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
           cache: maven
 
+      - name: Check Java version
+        run: |
+          java -version
+          javac -version
+          mvn -version
+
       - name: Build and test
         run: |
-          mvn --batch-mode clean package
+          mvn --batch-mode --errors --fail-at-end clean package
+
+      - name: Show target directory
+        if: always()
+        run: |
+          echo "Target directory:"
+          ls -lah target/ || true
+
+          echo
+          echo "Generated JAR files:"
+          find target -maxdepth 1 -type f -name "*.jar" -print || true
 
       - name: Verify JAR
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "Checking generated JAR files..."
-
-          find target -maxdepth 1 -type f -name "*.jar" -print
 
           JAR_COUNT=$(find target -maxdepth 1 -type f -name "*.jar" | wc -l)
 
@@ -93,7 +104,7 @@ jobs:
           fi
 
           if [ "$JAR_COUNT" -gt 1 ]; then
-            echo "ERROR: More than one JAR file was generated:"
+            echo "ERROR: Multiple JAR files were generated:"
             find target -maxdepth 1 -type f -name "*.jar" -print
             exit 1
           fi
@@ -107,7 +118,6 @@ jobs:
           path: target/*.jar
           if-no-files-found: error
           retention-days: 7
-
 
   # ============================================================
   # DEPLOY
