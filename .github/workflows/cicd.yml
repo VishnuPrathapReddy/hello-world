@@ -44,36 +44,121 @@
 
 
 
-deploy:
+name: Java Deployment
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ============================================================
+  # BUILD
+  # ============================================================
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build and test
+        run: |
+          mvn --batch-mode clean package
+
+      - name: Verify JAR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking generated JAR files..."
+
+          find target -maxdepth 1 -type f -name "*.jar" -print
+
+          JAR_COUNT=$(find target -maxdepth 1 -type f -name "*.jar" | wc -l)
+
+          if [ "$JAR_COUNT" -eq 0 ]; then
+            echo "ERROR: No JAR file was generated."
+            exit 1
+          fi
+
+          if [ "$JAR_COUNT" -gt 1 ]; then
+            echo "ERROR: More than one JAR file was generated:"
+            find target -maxdepth 1 -type f -name "*.jar" -print
+            exit 1
+          fi
+
+          echo "JAR verification successful."
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+          if-no-files-found: error
+          retention-days: 7
+
+
+  # ============================================================
+  # DEPLOY
+  # ============================================================
+  deploy:
     name: Deploy to EC2
     needs: build
     runs-on: ubuntu-latest
 
     steps:
+
+      # --------------------------------------------------------
+      # Download artifact
+      # --------------------------------------------------------
       - name: Download JAR artifact
         uses: actions/download-artifact@v4
         with:
           name: app-jar
           path: artifact
 
-      - name: Verify artifact
+      # --------------------------------------------------------
+      # Verify artifact
+      # --------------------------------------------------------
+      - name: Verify downloaded JAR
+        shell: bash
         run: |
           set -euo pipefail
+
+          echo "Downloaded files:"
+          ls -lah artifact/
 
           JAR_COUNT=$(find artifact -maxdepth 1 -type f -name "*.jar" | wc -l)
 
           if [ "$JAR_COUNT" -ne 1 ]; then
-            echo "ERROR: Expected exactly one JAR, found $JAR_COUNT"
-            find artifact -maxdepth 1 -type f -print
+            echo "ERROR: Expected exactly one JAR."
+            echo "Found: $JAR_COUNT"
             exit 1
           fi
 
           JAR=$(find artifact -maxdepth 1 -type f -name "*.jar" -print -quit)
 
-          echo "JAR_PATH=$JAR" >> "$GITHUB_ENV"
-          echo "Using JAR: $JAR"
+          echo "JAR found: $JAR"
 
-      - name: Validate configuration
+          echo "JAR_PATH=$JAR" >> "$GITHUB_ENV"
+
+
+      # --------------------------------------------------------
+      # Validate GitHub configuration
+      # --------------------------------------------------------
+      - name: Validate deployment configuration
+        shell: bash
         env:
           EC2_HOST: ${{ vars.EC2_HOST }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
@@ -81,35 +166,71 @@ deploy:
           set -euo pipefail
 
           if [ -z "$EC2_HOST" ]; then
-            echo "ERROR: EC2_HOST is not configured."
+            echo "ERROR: EC2_HOST variable is missing."
+            echo "Go to:"
+            echo "Settings -> Secrets and variables -> Actions -> Variables"
             exit 1
           fi
 
           if [ -z "$EC2_SSH_KEY" ]; then
-            echo "ERROR: EC2_SSH_KEY is not configured."
+            echo "ERROR: EC2_SSH_KEY secret is missing."
+            echo "Go to:"
+            echo "Settings -> Secrets and variables -> Actions -> Secrets"
             exit 1
           fi
 
-      - name: Prepare SSH
+          echo "Deployment configuration is present."
+
+
+      # --------------------------------------------------------
+      # Prepare SSH
+      # --------------------------------------------------------
+      - name: Prepare SSH key
+        shell: bash
         env:
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-          EC2_HOST: ${{ vars.EC2_HOST }}
         run: |
           set -euo pipefail
 
           umask 077
+
           printf '%s\n' "$EC2_SSH_KEY" > key.pem
+
           chmod 600 key.pem
+
+          echo "Validating SSH private key..."
 
           ssh-keygen -y -f key.pem > /dev/null
 
+          echo "SSH key is valid."
+
+
+      # --------------------------------------------------------
+      # Configure known hosts
+      # --------------------------------------------------------
+      - name: Configure SSH known hosts
+        shell: bash
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
           mkdir -p ~/.ssh
+
           chmod 700 ~/.ssh
 
           ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
           chmod 600 ~/.ssh/known_hosts
 
-      - name: Check SSH connection
+          echo "Known host configured."
+
+
+      # --------------------------------------------------------
+      # Test SSH
+      # --------------------------------------------------------
+      - name: Test EC2 connection
+        shell: bash
         env:
           EC2_HOST: ${{ vars.EC2_HOST }}
         run: |
@@ -120,9 +241,14 @@ deploy:
             -o BatchMode=yes \
             -o ConnectTimeout=15 \
             ec2-user@"$EC2_HOST" \
-            "echo 'Connected to EC2 successfully'"
+            "echo 'SSH connection successful'"
 
+
+      # ========================================================
+      # CHECK / INSTALL JAVA
+      # ========================================================
       - name: Check and install Java 17
+        shell: bash
         env:
           EC2_HOST: ${{ vars.EC2_HOST }}
         run: |
@@ -137,17 +263,19 @@ deploy:
           set -euo pipefail
 
           echo "======================================"
-          echo "Checking Java"
+          echo "Checking Java 17"
           echo "======================================"
 
           JAVA_OK=false
 
-          # Check whether Java exists and is Java 17.
+          # --------------------------------------------------
+          # Check existing Java
+          # --------------------------------------------------
           if command -v java >/dev/null 2>&1; then
-              JAVA_VERSION=$(java -version 2>&1 | head -n 1 || true)
 
-              echo "Java found:"
-              echo "$JAVA_VERSION"
+              echo "Java executable found."
+
+              java -version || true
 
               if java -version 2>&1 | grep -q '"17\.'; then
                   JAVA_OK=true
@@ -155,72 +283,98 @@ deploy:
               else
                   echo "Java exists, but it is not Java 17."
               fi
+
           else
+
               echo "Java is not installed."
+
           fi
+
 
           # --------------------------------------------------
           # Install Java 17 if necessary
           # --------------------------------------------------
-
           if [ "$JAVA_OK" = false ]; then
 
-              echo
               echo "Installing Java 17..."
 
-              # Amazon Linux 2023
-              if [ -f /etc/os-release ] && grep -qi "Amazon Linux" /etc/os-release; then
+              # Amazon Linux
+              if [ -f /etc/os-release ] && \
+                 grep -qi "Amazon Linux" /etc/os-release; then
+
+                  echo "Amazon Linux detected."
 
                   if command -v dnf >/dev/null 2>&1; then
+
                       sudo dnf install -y java-17-amazon-corretto
 
                   elif command -v yum >/dev/null 2>&1; then
+
                       sudo yum install -y java-17-amazon-corretto
 
                   else
-                      echo "ERROR: Could not find dnf or yum."
+
+                      echo "ERROR: Neither dnf nor yum was found."
                       exit 1
+
                   fi
+
 
               # Ubuntu / Debian
               elif command -v apt-get >/dev/null 2>&1; then
 
+                  echo "Ubuntu/Debian detected."
+
                   sudo apt-get update
+
                   sudo apt-get install -y openjdk-17-jdk
 
+
               else
+
                   echo "ERROR: Unsupported Linux distribution."
                   echo "Please install Java 17 manually."
                   exit 1
+
               fi
+
           fi
 
-          # --------------------------------------------------
-          # Verify Java after installation
-          # --------------------------------------------------
 
+          # --------------------------------------------------
+          # Verify Java
+          # --------------------------------------------------
           echo
           echo "======================================"
           echo "Verifying Java 17"
           echo "======================================"
 
           if ! command -v java >/dev/null 2>&1; then
-              echo "ERROR: Java installation failed."
+
+              echo "ERROR: Java executable still not found."
               exit 1
+
           fi
 
           java -version
 
           if ! java -version 2>&1 | grep -q '"17\.'; then
+
               echo "ERROR: Java 17 is not active."
               exit 1
+
           fi
 
           echo "Java 17 is ready."
 
           REMOTE_SCRIPT
 
-      - name: Create application directory
+
+      # ========================================================
+      # PREPARE APPLICATION DIRECTORY
+      # ========================================================
+      - name: Prepare application directory
+        shell: bash
         env:
           EC2_HOST: ${{ vars.EC2_HOST }}
         run: |
@@ -232,11 +386,20 @@ deploy:
             ec2-user@"$EC2_HOST" \
             "sudo mkdir -p /opt/myapp && sudo chown ec2-user:ec2-user /opt/myapp"
 
-      - name: Upload application JAR
+          echo "Application directory is ready."
+
+
+      # ========================================================
+      # UPLOAD JAR
+      # ========================================================
+      - name: Upload JAR to EC2
+        shell: bash
         env:
           EC2_HOST: ${{ vars.EC2_HOST }}
         run: |
           set -euo pipefail
+
+          echo "Uploading application..."
 
           scp \
             -i key.pem \
@@ -244,7 +407,46 @@ deploy:
             "$JAR_PATH" \
             ec2-user@"$EC2_HOST":/opt/myapp/app.jar
 
+          echo "Application uploaded."
+
+
+      # ========================================================
+      # VERIFY JAR ON EC2
+      # ========================================================
+      - name: Verify JAR on EC2
+        shell: bash
+        env:
+          EC2_HOST: ${{ vars.EC2_HOST }}
+        run: |
+          set -euo pipefail
+
+          ssh \
+            -i key.pem \
+            -o BatchMode=yes \
+            ec2-user@"$EC2_HOST" \
+            'bash -s' <<'REMOTE_SCRIPT'
+
+          set -euo pipefail
+
+          if [ ! -s /opt/myapp/app.jar ]; then
+              echo "ERROR: JAR does not exist or is empty."
+              exit 1
+          fi
+
+          chmod 644 /opt/myapp/app.jar
+
+          echo "JAR successfully uploaded."
+
+          ls -lh /opt/myapp/app.jar
+
+          REMOTE_SCRIPT
+
+
+      # ========================================================
+      # START / RESTART APPLICATION
+      # ========================================================
       - name: Start or restart application
+        shell: bash
         env:
           EC2_HOST: ${{ vars.EC2_HOST }}
         run: |
@@ -266,69 +468,98 @@ deploy:
           echo "Checking application"
           echo "======================================"
 
-          # Make sure the JAR exists.
+
+          # --------------------------------------------------
+          # Verify JAR
+          # --------------------------------------------------
           if [ ! -s "$APP_JAR" ]; then
-              echo "ERROR: $APP_JAR does not exist or is empty."
+
+              echo "ERROR: $APP_JAR does not exist."
               exit 1
+
           fi
 
-          sudo chmod 644 "$APP_JAR"
 
-          # Make sure systemd knows about the service.
-          if ! systemctl list-unit-files | grep -q "^${SERVICE}.service"; then
+          # --------------------------------------------------
+          # Verify systemd service
+          # --------------------------------------------------
+          if ! systemctl list-unit-files | \
+             grep -q "^${SERVICE}.service"; then
+
               echo "ERROR: ${SERVICE}.service does not exist."
+
               echo
-              echo "Expected service file:"
+              echo "Create:"
               echo "/etc/systemd/system/myapp.service"
+
               exit 1
+
           fi
 
+
+          # --------------------------------------------------
+          # Reload systemd
+          # --------------------------------------------------
           sudo systemctl daemon-reload
 
-          echo
-          echo "======================================"
-          echo "Starting/restarting application"
-          echo "======================================"
 
-          # If service is already running, restart it.
+          # --------------------------------------------------
+          # Enable service
+          # --------------------------------------------------
+          sudo systemctl enable "$SERVICE"
+
+
+          # --------------------------------------------------
+          # Start or restart
+          # --------------------------------------------------
           if sudo systemctl is-active --quiet "$SERVICE"; then
+
               echo "Application is already running."
-              echo "Restarting application..."
+              echo "Restarting..."
 
               sudo systemctl restart "$SERVICE"
 
           else
+
               echo "Application is not running."
-              echo "Starting application..."
+              echo "Starting..."
 
               sudo systemctl start "$SERVICE"
+
           fi
 
-          # Enable application to start automatically after EC2 reboot.
-          sudo systemctl enable "$SERVICE"
 
+          # --------------------------------------------------
+          # Wait for service
+          # --------------------------------------------------
           echo
-          echo "Waiting for application..."
+          echo "Waiting for application to start..."
 
           for i in {1..15}; do
+
               if sudo systemctl is-active --quiet "$SERVICE"; then
+
                   echo
                   echo "======================================"
-                  echo "Application is running successfully."
+                  echo "DEPLOYMENT SUCCESSFUL"
                   echo "======================================"
 
                   sudo systemctl --no-pager status "$SERVICE"
+
                   exit 0
+
               fi
 
-              echo "Waiting... attempt $i/15"
+              echo "Waiting... $i/15"
+
               sleep 2
+
           done
 
-          # --------------------------------------------------
-          # Application failed to start
-          # --------------------------------------------------
 
+          # --------------------------------------------------
+          # Service failed
+          # --------------------------------------------------
           echo
           echo "======================================"
           echo "APPLICATION FAILED TO START"
@@ -346,7 +577,12 @@ deploy:
 
           REMOTE_SCRIPT
 
+
+      # ========================================================
+      # CLEANUP
+      # ========================================================
       - name: Cleanup SSH key
         if: always()
+        shell: bash
         run: |
           rm -f key.pem
